@@ -1,0 +1,15 @@
+Scoring scenario 2 on run 1:
+
+ann: D:\pyproject\pucrj-pucpr-ufmg-main\pucrj-pucpr-ufmg-main\data\preprocessed2\dev.ann
+ann: output\model\develop\run1\scenario2-taskA\output.ann
+correct_A: 4472
+incorrect_A: 0
+partial_A: 331
+spurious_A: 371
+missing_A: 609
+--------------------
+recall: 0.8569
+precision: 0.8963
+f1: 0.8762
+Run 2 not found!
+Run 3 not found!

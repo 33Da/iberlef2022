@@ -1,0 +1,15 @@
+baseline 0.8801
+
+
+four
+Entity report:
+              precision    recall  f1-score   support
+
+     B-HUMAN       0.93      0.96      0.95      2262
+     I-HUMAN       0.88      0.87      0.87       219
+   B-SPECIES       0.89      0.94      0.91      2859
+   I-SPECIES       0.89      0.89      0.89      1830
+
+   micro avg       0.90      0.93      0.92      7170
+   macro avg       0.90      0.92      0.91      7170
+weighted avg       0.90      0.93      0.92      7170

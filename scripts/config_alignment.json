@@ -1,0 +1,7 @@
+{
+  "pretrained_model_path": "google/mt5-base",
+  "input_path": "data/original/eval/develop/scenario3-taskB/",
+  "output_file_name": "input_mt5.json",
+  "is_ref": false,
+  "is_test": false
+}

@@ -1,0 +1,502 @@
+
+import json
+import torch
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+from sklearn.metrics import classification_report
+import os
+from shutil import copyfile
+from pathlib import Path
+from Adversarial import PGD,FreeLB
+import utils
+import postprocessing
+from transformers import AutoTokenizer
+
+class ProcDataset(Dataset):
+    def __init__(self, data):
+        """
+        Args:
+            data (string): data
+        """
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+class Train:
+    def __init__(self, model, criterion, optimizer, scheduler, traindata, devdata, epochs, batch_size, batch_status=16,
+                 early_stop=3, device='cuda', write_path='model.pt', eval_mode='develop',
+                 pretrained_model='multilingual', log_path='logs', relations_positive_negative=False, relations_inv=False, task='entity', loss_func=None, loss_optimizer=None):
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.batch_status = batch_status
+        self.early_stop = early_stop
+        self.device = device
+        self.task = task
+
+        self.traindata = traindata
+        self.devdata = devdata
+
+        self.model = model
+        # set grad requirement based on the task
+        if self.task == 'entity':
+            for param in self.model.linear_layer.parameters():
+                param.requires_grad = False
+            # for param in self.model.related_classifier.parameters():
+            #     param.requires_grad = False
+            for param in self.model.entity_classifier.parameters():
+                param.requires_grad = True
+            self.scenario = 2
+        elif self.task == 'relation':
+            for param in self.model.linear_layer.parameters():
+                param.requires_grad = True
+            for param in self.model.related_classifier.parameters():
+                param.requires_grad = True
+            for param in self.model.entity_classifier.parameters():
+                param.requires_grad = False
+            self.scenario = 3
+        else:
+            for param in self.model.linear_layer.parameters():
+                param.requires_grad = True
+            for param in self.model.related_classifier.parameters():
+                param.requires_grad = True
+            for param in self.model.entity_classifier.parameters():
+                param.requires_grad = True
+            self.scenario = 1
+        self.loss_func = loss_func
+        self.loss_optimizer = loss_optimizer
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+        self.write_path = write_path
+        self.log_path = log_path
+        if not os.path.exists(log_path):
+            os.mkdir(log_path)
+
+        self.eval_mode = eval_mode
+        self.pretrained_model = pretrained_model
+
+        self.relations_inv = relations_inv
+        self.entities = utils.ENTITIES
+        self.relations = utils.RELATIONS
+        self.entity_w2id = utils.entity_w2id
+        self.relation_w2id = utils.relation_w2id
+        if relations_inv:
+            self.relations = utils.RELATIONS_INV
+            self.relation_w2id = utils.relation_inv_w2id
+
+        # only use relations_positive_negative for train data
+        self.traindata = DataLoader(self.preprocess(traindata, relations_positive_negative=relations_positive_negative),
+                                    batch_size=batch_size, shuffle=False)
+        self.devdata = DataLoader(self.preprocess(devdata), batch_size=batch_size, shuffle=False)
+
+    def __str__(self):
+        return "Epochs: {}\nBatch size: {}\nEarly stop: {}\nData: {}\nPretrained model: {}".format(self.epochs,
+                                                                                                   self.batch_size,
+                                                                                                   self.early_stop,
+                                                                                                   self.eval_mode,
+                                                                                                   self.pretrained_model)
+
+    def _get_relations_data(self, row):
+        relation, relation_type = [], []
+        for relation_ in row['relations']:
+            try:
+                arg1 = relation_['arg1']
+                arg1_idx0 = row['keyphrases'][str(arg1)]['idxs'][0]
+
+                arg2 = relation_['arg2']
+                arg2_idx0 = row['keyphrases'][str(arg2)]['idxs'][0]
+
+                label = relation_['label']
+                relation.append((arg1_idx0, arg2_idx0, self.relation_w2id[label]))
+            except:
+                pass
+
+        # negative relation examples
+        arg1_idx0s = [w[0] for w in relation]
+        arg2_idx0s = [w[1] for w in relation]
+        for arg1_idx0 in arg1_idx0s:
+            for arg2_idx0 in arg2_idx0s:
+                f = [w for w in relation if w[0] == arg1_idx0 and w[1] == arg2_idx0]
+                if len(f) == 0:
+                    relation.append((arg1_idx0, arg2_idx0, 0))
+
+                f = [w for w in relation if w[0] == arg2_idx0 and w[1] == arg1_idx0]
+                if len(f) == 0:
+                    relation.append((arg2_idx0, arg1_idx0, 0))
+        return relation#, relation_type
+
+
+    def _get_relations_positive_negative_data(self, row):
+        relation, relation_type = [], []
+        for relation_ in row['relations_positive_negative']:
+            try:
+                arg1 = relation_['arg1']
+                arg1_idx0 = row['keyphrases'][str(arg1)]['idxs'][0]
+
+                arg2 = relation_['arg2']
+                arg2_idx0 = row['keyphrases'][str(arg2)]['idxs'][0]
+
+                label = relation_['label']
+                if label == 'NONE':
+                    relation.append((arg1_idx0, arg2_idx0, 0))
+                else:
+                    relation.append((arg1_idx0, arg2_idx0, self.relation_w2id[label]))
+            except:
+                pass
+        return relation#, relation_type
+
+    def preprocess(self, procset, relations_positive_negative=False):
+        inputs = []
+        # tokenizer = AutoTokenizer.from_pretrained("dccuchile/bert-base-spanish-wwm-cased", do_lower_case=False)
+        for row in procset:
+
+            text = row['text']
+            # text = tokenizer(text, padding='max_length', truncation=True, max_length=256,
+            #                    return_tensors="pt").to(self.device)
+            tokens = row['tokens']
+
+            size = len(tokens)
+            entity = size * [0]
+
+            # entity gold-standard
+            for keyid in row['keyphrases']:
+                try:
+                    keyphrase = row['keyphrases'][keyid]
+                    idxs = keyphrase['idxs']
+
+                    # mark only first subword with entity type
+                    label_begin_idx = self.entity_w2id['B-' + keyphrase['label']]
+                    label_internal_idx = self.entity_w2id['I-' + keyphrase['label']]
+                    first = True
+                    for idx in idxs:
+                        if not tokens[idx].startswith('##'):
+                            if first:
+                                entity[idx] = label_begin_idx
+                                first = False
+                            else:
+                                entity[idx] = label_internal_idx
+                except:
+                    pass
+
+            # relations gold-standards
+            if relations_positive_negative:
+                relation = self._get_relations_positive_negative_data(row)
+            else:
+                relation = self._get_relations_data(row)
+
+            inputs.append({
+                'X': text,
+                'entity': entity,
+                'relation': relation,
+            })
+        return ProcDataset(inputs)
+
+    def compute_loss_full(self, entity_probs, batch_entity):
+        # entity loss
+        batch, seq_len, dim = entity_probs.size()
+        entity_real = torch.nn.utils.rnn.pad_sequence(batch_entity).transpose(0, 1).to(self.device)
+
+        entity_loss = self.criterion(entity_probs.view(batch*seq_len, dim)[:256,:], entity_real.view(-1)[:256])
+
+        # relation loss
+        # batch, seq_len, dim = related_probs.size()
+        # rowcol_len = int(np.sqrt(seq_len))
+        # relation_real = torch.zeros((batch, rowcol_len, rowcol_len)).long().to(self.device)
+        # for i in range(batch):
+        #     try:
+        #         rows, columns = batch_relation[i][:, 0], batch_relation[i][:, 1]
+        #         labels = batch_relation[i][:, 2]
+        #         relation_real[i, rows, columns] = labels.to(self.device)
+        #     except:
+        #         pass
+
+        # relation_loss = self.criterion(related_probs.view(batch*seq_len, dim), relation_real.view(-1))
+
+        # if self.task == 'entity':
+        #     return entity_loss
+        # elif self.task == 'relation':
+        #     return relation_loss
+        # else:
+        #     loss = self.loss_func(entity_loss, relation_loss)
+        #     return loss
+        return entity_loss
+
+    def compute_loss(self, entity_probs, batch_entity, related_probs, batch_relation):
+        # entity loss
+        batch, seq_len, dim = entity_probs.size()
+        entity_real = torch.nn.utils.rnn.pad_sequence(batch_entity).transpose(0, 1).to(self.device)
+        entity_loss = self.criterion(entity_probs.view(batch * seq_len, dim), entity_real.reshape(-1))
+
+        # relation loss
+        batch, seq_len, dim = related_probs.size()
+        rowcol_len = int(np.sqrt(seq_len))
+        related_probs = related_probs.view((batch, rowcol_len, rowcol_len, dim))
+
+        related_real = []
+        related_pred = []
+        for i in range(batch):
+            try:
+                rows, columns = batch_relation[i][:, 0], batch_relation[i][:, 1]
+                labels = batch_relation[i][:, 2]
+                related_real.extend(labels.tolist())
+
+                preds = related_probs[i, rows, columns]
+                related_pred.append(preds)
+            except:
+                pass
+
+        try:
+            related_pred = torch.cat(related_pred, 0).to(self.device)
+            related_real = torch.tensor(related_real).to(self.device)
+            relation_loss = self.criterion(related_pred, related_real)
+        except:
+            relation_loss = 0
+
+        if self.task == 'entity':
+            return entity_loss
+        elif self.task == 'relation':
+            return relation_loss
+        else:
+            loss = self.loss_func(entity_loss, relation_loss)
+            return loss
+
+    def train(self):
+        pgd = PGD(self.model, emb_name='word_embeddings.', epsilon=1.0, alpha=0.3)
+
+        freelb = FreeLB()
+        # max_f1_score = self.eval()
+        max_f1_score = -1
+        repeat = 0
+        for epoch in range(self.epochs):
+
+            self.model.train()
+            losses = []
+
+            for batch_idx, inp in enumerate(self.traindata):
+                batch_X = inp['X']
+
+                # loss = freelb.attack(self.model, batch_X)
+
+                # Calculate loss
+                batch_entity = torch.tensor([inp['entity']]).cuda()
+
+                entity_probs,loss = self.model(batch_X,batch_entity)
+
+                self.optimizer.zero_grad()
+                if self.loss_optimizer:
+                    self.loss_optimizer.zero_grad()
+
+
+                # batch_relation = torch.tensor([inp['relation']])
+                # loss = self.compute_loss_full(entity_probs,
+                #                               batch_entity
+                #                               )
+                losses.append(float(loss))
+
+                # Backpropagation
+                loss.backward()
+                pgd.backup_grad()
+                K = 3
+                for t in range(K):
+                    pgd.attack(is_first_attack=(t == 0))  # 在embedding上添加对抗扰动, first attack时备份param.data
+                    if t != K - 1:
+                        self.optimizer.zero_grad()
+                    else:
+                        pgd.restore_grad()
+                    entity_probs,loss_adv = self.model(batch_X,batch_entity)
+                    # loss_adv = self.compute_loss_full(entity_probs,
+                    #                                   batch_entity
+                    #                                   )
+                    loss_adv.backward()  # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
+                pgd.restore()  # 恢复embedding参数
+                self.optimizer.step()
+                if self.loss_optimizer:
+                    self.loss_optimizer.step()
+
+                # Display
+                if (batch_idx + 1) % self.batch_status == 0:
+                    print('Scheduler LR: {}'.format(self.scheduler.get_last_lr()))
+                    print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tTotal Loss: {:.6f}'.format(
+                        epoch, batch_idx + 1, len(self.traindata),
+                               100. * batch_idx / len(self.traindata), float(loss), round(sum(losses) / len(losses), 5)))
+            self.scheduler.step()
+
+            # evaluating
+            real_f1 = self.eval_class_report()
+            result_file_name = os.path.join(self.log_path, 'epoch' + str(epoch+1) + '.log')
+            # 将f1写进log里面
+            f1_score = self.eval(result_file_name)
+            print('F1 score:', f1_score)
+            if f1_score > max_f1_score:
+                max_f1_score = f1_score
+                repeat = 0
+
+                print('Saving best model...')
+                torch.save(self.model, self.write_path)
+                print('Saving best model log...')
+                best_log_path = os.path.join(self.log_path, 'best.log')
+                copyfile(result_file_name, best_log_path)
+            else:
+                repeat += 1
+
+            if repeat == self.early_stop:
+                print('Total epochs:', (epoch + 1))
+                break
+
+    def eval_class_report(self, devdata=None):
+        def _get_single_output_id_list(y):
+            return [index for indexes in y for index in indexes]
+
+        if devdata is not None:
+            self.devdata = DataLoader(self.preprocess(devdata), batch_size=self.batch_size)
+
+        self.model.eval()
+
+        entity_pred, entity_true, is_related_pred, is_related_true, relation_pred, relation_true = [], [], [], [], [], []
+        index = 0
+        for inp in self.devdata:
+            index += 1
+            sentence = inp['X']
+            entity_ids = inp['entity']
+            relation_ids = inp['relation']
+
+            # Predict
+            # entity_probs, related_probs = self.model(sentence)
+            entity_probs = self.model(sentence)
+
+            len_sentence = entity_probs.shape[1]
+
+            # Entity
+            entity_pred.append([int(w) for w in list(entity_probs[0].argmax(dim=1))])
+            entity_true.append([int(w) for w in list(entity_ids)])
+
+            # Is Related
+            # related_array = [int(w) for w in list(related_probs[0].argmax(dim=1))]
+            # related_matrix = np.array(related_array).reshape((len_sentence, len_sentence))
+            # current_is_related_true, current_is_related_pred = self._get_relation_eval(relation_ids, related_matrix)
+            # is_related_true.extend(current_is_related_true)
+            # is_related_pred.extend(current_is_related_pred)
+
+        entity_labels = list(range(1, len(self.entities)))
+        entity_target_names = self.entities[1:]
+        print("Entity report:")
+        for index,(tru,pre) in enumerate(zip(entity_true,entity_pred)):
+            if len(tru) != len(pre):
+                off = min(len(tru),len(pre))
+                entity_true[index] = entity_true[index][:off]
+                entity_pred[index] = entity_pred[index][:off]
+
+
+        print(classification_report(_get_single_output_id_list(entity_true), _get_single_output_id_list(entity_pred),
+                                    labels=entity_labels, target_names=entity_target_names,digits=4))
+        with open("erpoch_result.txt","a+",encoding="utf-8") as f:
+            str = classification_report(_get_single_output_id_list(entity_true), _get_single_output_id_list(entity_pred),
+                                  labels=entity_labels, target_names=entity_target_names,digits=4)
+            f.write(str)
+            f.write("************************************\n")
+        #
+        # relation_labels = list(range(1, len(self.relations)))
+        # relation_target_names = self.relations[1:]
+        # print("Is related report:")
+        # print(classification_report(is_related_true, is_related_pred, labels=relation_labels,
+        #                             target_names=relation_target_names))
+        return str
+
+    def test(self, devdata=None):
+
+        if devdata is not None:
+            test_dev_X = self.preprocess(devdata)
+        else:
+            test_dev_X = self.devdata
+
+        self.model.eval()
+
+        entity_pred, related_pred = [], []
+        for sentence in test_dev_X:
+            # Predict
+            # entity_probs, related_probs = self.model(sentence['X'])
+            entity_probs = self.model(sentence['X'])
+
+            len_sentence = entity_probs.shape[1]
+
+            # Entity
+            entity_pred.append([int(w) for w in list(entity_probs[0].argmax(dim=1))])
+
+            # Related
+            # related_array = [int(w) for w in list(related_probs[0].argmax(dim=1))]
+            # related_matrix = np.array(related_array).reshape((len_sentence, len_sentence))
+            # related_pred.append(self._get_relation_output(related_matrix, 1, len_sentence))
+
+        return entity_pred # , related_pred
+
+    def eval(self,filename, result_file_name="result_my.txt", verbose=False, scenario=None):
+
+        # test
+        # devdata_folder = r"../data/preprocessed2/"+filename +'.json'     #'data/original/eval/%s/' % self.eval_mode
+
+        #train
+        devdata_folder = r"../data/preprocessed/devset.json"
+        output_folder = 'output/model/%s/' % self.eval_mode
+
+        # scenario_folder_list = ['scenario1-main/', 'scenario2-taskA/', 'scenario3-taskB/']
+        scenario_folder_list = ['scenario2-taskA/']
+        for scenario_folder in scenario_folder_list:
+            devdata_path = devdata_folder# devdata_folder + scenario_folder + 'input_%s.json' % self.pretrained_model
+            devdata = json.load(open(devdata_path))
+            # entity_pred, related_pred = self.test(devdata)
+            entity_pred = self.test(devdata)
+
+            output_path = '%s/run1/%s/%s' % (output_folder, scenario_folder,filename)
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
+
+            c = postprocessing.get_collection(devdata, entity_pred)
+            output_file_name = output_path + 'output.txt'
+            c.dump(Path(output_file_name))
+        dev_folder = "../data/preprocessed"
+        command_text = "python ../data/scripts/score.py --gold {0} --submit {1}".format(dev_folder, output_folder)
+        if verbose:
+            command_text += " --verbose"
+        if scenario is not None:
+            command_text += " --scenarios {0}".format(scenario)
+        command_text += " > {0}".format(result_file_name)
+        os.system(command_text)
+
+        f1_score = 0.0
+        print("command_text",command_text)
+        print("result_file_name",result_file_name)
+        with open(result_file_name, 'r',encoding="utf-8") as f:
+            print('Evaluation:')
+            # print(f.read())
+        isScenario = False
+        with open(result_file_name, 'r',encoding="utf-8") as f:
+            for line in f:
+                if 'scenario ' + str(self.scenario) in line:
+                    isScenario = True
+                if isScenario and line.startswith("f1:"):
+                    f1_score = float(line.split(':')[-1].strip())
+                    break
+        return f1_score
+
+    @staticmethod
+    def _get_relation_output(relation_matrix, relation_value, len_sentence):
+        relation_output = []
+        for i in range(len_sentence):
+            for j in range(len_sentence):
+                if relation_matrix[i, j] >= relation_value:
+                    relation_output.append((i, j, int(relation_matrix[i, j])))
+        return relation_output
+
+    @staticmethod
+    def _get_relation_eval(relation_ids, relation_matrix):
+        relation_true, relation_pred = [], []
+        for relation in relation_ids:
+            idx1, idx2, label = relation
+            relation_true.append(int(label))
+            relation_pred.append(int(relation_matrix[idx1, idx2]))
+        return relation_true, relation_pred
